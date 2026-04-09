@@ -1,12 +1,12 @@
-//! Run with
-//!
-//! ```not_rust
-//! cargo run -p example-hello-world
-//! ```
+#[deny(unused_mut)]
+#[deny(unused_imports)]
+
+mod fetch;
 
 use axum::{response::Html, routing::get, Json, Router, http::Method, routing::any};
 use tower_http::cors::{Any, CorsLayer};
 use tokio::net::TcpListener;
+use crate::fetch::fetch_timetable;
 
 #[tokio::main]
 async fn main() {
@@ -18,6 +18,7 @@ async fn main() {
     let app = Router::new()
         .route("/", any(handler))
         .route("/sans", get(sans_handler))
+        .route("/fetch", get(fetch_handler))
         .layer(cors);
 
     // run it
@@ -34,4 +35,19 @@ async fn handler(method: Method) -> Json<&'static str> {
 
 async fn sans_handler() -> Html<&'static str> {
     Html("<h1>Sans</h1>")
+}
+
+async fn fetch_handler() {
+    fetch_timetable("", "6");
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_fetch() {
+        let data = fetch_timetable("", "").unwrap();
+        println!("{:?}", data);
+    }
 }

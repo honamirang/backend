@@ -7,3 +7,11 @@ edition = "2024"
 tokio = { version = "1.51.0", features = ["rt-multi-thread"] }
 axum = { version = "0.8.8" }
 tower-http = { version = "0.6.8", features = ["cors"] }
+serde_json = { version = "1.0.128" }
+aes = "0.8"
+cbc = "0.1"
+base64 = "0.21"
+chrono = "0.4.44"
+quick-xml = "0.39.2"
+thiserror = "2.0.18"
+reqwest = { version = "0.13.2", features = ["blocking", "cookies", "query", "form", "native-tls"] }
