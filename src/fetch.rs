@@ -6,6 +6,7 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::iter::repeat_n;
 use thiserror::Error;
 use reqwest::blocking::{Client, Response};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT_LANGUAGE, CONTENT_TYPE};
@@ -262,7 +263,7 @@ fn encrypt_nmain_payload(plain_xml: &str) -> String {
     let mut data = plain_xml.as_bytes().to_vec();
     let rem = data.len() % 16;
     if rem != 0 {
-        data.extend(std::iter::repeat(0u8).take(16 - rem));
+        data.extend(repeat_n(0u8, 16 - rem));
     }
     let mut buf = data.clone();
     Aes128CbcEnc::new(AES_KEY.into(), AES_IV.into())
@@ -390,7 +391,7 @@ fn parse_xml_response(xml_text: &str) -> Result<NMainResponse> {
 
     let strip_ns = |name: &[u8]| -> String {
         let s = std::str::from_utf8(name).unwrap_or("");
-        s.split(':').last().unwrap_or(s).to_string()
+        s.split(':').next_back().unwrap_or(s).to_string()
     };
 
     let mut buf = Vec::new();
@@ -431,10 +432,9 @@ fn parse_xml_response(xml_text: &str) -> Result<NMainResponse> {
                 match strip_ns(e.name().as_ref()).as_str() {
                     "Parameter" => { current_param_id = None; }
                     "Row" => {
-                        if let (Some(ds_id), Some(row)) = (&current_dataset_id, current_row.take()) {
-                            if let Some(ds) = resp.datasets.get_mut(ds_id) {
-                                ds.push(row);
-                            }
+                        if let (Some(ds_id), Some(row)) = (&current_dataset_id, current_row.take())
+                            && let Some(ds) = resp.datasets.get_mut(ds_id) {
+                            ds.push(row);
                         }
                     }
                     "Col" => { current_col_id = None; }
@@ -500,9 +500,7 @@ fn post_nmain(session: &HttpSession, plain_xml: &str) -> Result<NMainResponse> {
 
 // ─── SSO + direct login ────────────────────────────────────────────────────────
 
-fn sso_login(user_id: &str, password: &str) -> Result<HttpSession> {
-    let session = HttpSession::new(TIMEOUT)?;
-
+fn sso_login(session: &HttpSession, user_id: &str, password: &str) -> Result<()> {
     let index_url = format!("{}/HUIS/index.html", HUIS_BASE);
     let home = session.get(&index_url, build_headers(None, None, None)?, &[])?;
     home.raise_for_status()?;
@@ -528,14 +526,14 @@ fn sso_login(user_id: &str, password: &str) -> Result<HttpSession> {
         return Err(HuisError::Login("SSO login failed. Check the credentials.".into()));
     }
 
-    let current = follow_auto_forms(&session, login_resp)?;
-    let current = follow_auto_forms(&session, current)?;
+    let current = follow_auto_forms(session, login_resp)?;
+    let current = follow_auto_forms(session, current)?;
 
     if !current.text.contains("ssoSuccess=1") && !current.text.contains("NEXACROHTML.Init") {
         return Err(HuisError::Login("SSO bootstrap did not complete as expected.".into()));
     }
 
-    Ok(session)
+    Ok(())
 }
 
 fn direct_login(session: &HttpSession, user_id: &str) -> Result<HashMap<String, String>> {
@@ -737,13 +735,12 @@ fn build_meeting_blocks(
 ) -> Vec<Value> {
     let mut course_index: HashMap<(String, Option<String>), &Value> = HashMap::new();
     for course in courses {
-        if let Some(name) = course.get("course_name").and_then(|v| v.as_str()) {
-            if !name.is_empty() {
+        if let Some(name) = course.get("course_name").and_then(|v| v.as_str()) &&
+            !name.is_empty() {
                 let prof = course.get("professor").and_then(|v| v.as_str()).map(|s| s.to_string());
                 course_index.insert((name.to_string(), prof.clone()), course);
                 course_index.entry((name.to_string(), None)).or_insert(course);
             }
-        }
     }
 
     let mut slot_rows: Vec<HashMap<String, Value>> = Vec::new();
@@ -836,7 +833,8 @@ fn build_meeting_blocks(
 // ─── Top-level fetch ──────────────────────────────────────────────────────────
 
 pub fn fetch_timetable(user_id: &str, password: &str) -> Result<Value> {
-    let session = sso_login(user_id, password)?;
+    let session = HttpSession::new(TIMEOUT)?;
+    sso_login(&session, user_id, password)?;
     let user_info = direct_login(&session, user_id)?;
 
     let actual_user_id = user_info.get("USRID").cloned().unwrap_or_else(|| user_id.to_string());
@@ -916,30 +914,26 @@ fn parse_auto_form(html: &str) -> Option<AutoForm> {
             continue;
         }
         if tag_lower == "form" && in_form { in_form = false; continue; }
-        if tag_lower == "input" && in_form {
-            if let Some(f) = form.as_mut() {
-                let name = attr_value(attr_str, "name").unwrap_or_default();
-                if name.is_empty() { continue; }
-                let input_type = attr_value(attr_str, "type")
-                    .unwrap_or_else(|| "text".into())
-                    .to_ascii_lowercase();
-                if input_type != "hidden" && input_type != "submit" {
-                    f.has_non_hidden_inputs = true;
-                }
-                let value = attr_value(attr_str, "value").unwrap_or_default();
-                f.inputs.push((name, value));
+        if tag_lower == "input" && in_form && let Some(f) = form.as_mut() {
+            let name = attr_value(attr_str, "name").unwrap_or_default();
+            if name.is_empty() { continue; }
+            let input_type = attr_value(attr_str, "type")
+                .unwrap_or_else(|| "text".into())
+                .to_ascii_lowercase();
+            if input_type != "hidden" && input_type != "submit" {
+                f.has_non_hidden_inputs = true;
             }
+            let value = attr_value(attr_str, "value").unwrap_or_default();
+            f.inputs.push((name, value));
         }
     }
 
-    if let Some(f) = form.as_mut() {
-        if f.action.is_empty() {
-            let marker = "var sendUrl = \"";
-            if let Some(idx) = html.find(marker) {
-                let after = &html[idx + marker.len()..];
-                if let Some(end) = after.find('"') {
-                    f.action = html_unescape(&after[..end]);
-                }
+    if let Some(f) = form.as_mut() && f.action.is_empty() {
+        let marker = "var sendUrl = \"";
+        if let Some(idx) = html.find(marker) {
+            let after = &html[idx + marker.len()..];
+            if let Some(end) = after.find('"') {
+                f.action = html_unescape(&after[..end]);
             }
         }
     }
@@ -951,11 +945,9 @@ fn attr_value(attrs: &str, name: &str) -> Option<String> {
     let pattern = format!("{}=", name.to_ascii_lowercase());
     let idx = lower.find(&pattern)?;
     let after = attrs[idx + pattern.len()..].trim_start();
-    if after.starts_with('"') {
-        let after = &after[1..];
+    if let Some(after) = after.strip_prefix('"') {
         Some(html_unescape(&after[..after.find('"').unwrap_or(after.len())]))
-    } else if after.starts_with('\'') {
-        let after = &after[1..];
+    } else if let Some(after) = after.strip_suffix('\'') {
         Some(html_unescape(&after[..after.find('\'').unwrap_or(after.len())]))
     } else {
         let end = after.find(|c: char| c.is_whitespace() || c == '>').unwrap_or(after.len());

@@ -1,5 +1,5 @@
-#[deny(unused_mut)]
-#[deny(unused_imports)]
+#![deny(unused_mut)]
+#![deny(unused_imports)]
 
 mod fetch;
 
@@ -38,7 +38,7 @@ async fn sans_handler() -> Html<&'static str> {
 }
 
 async fn fetch_handler() {
-    fetch_timetable("", "6");
+    fetch_timetable("", "");
 }
 
 #[cfg(test)]
