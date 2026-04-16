@@ -1,17 +1,20 @@
 use aes::Aes128;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+use cbc::cipher::{KeyIvInit};
 use chrono::{FixedOffset, Utc};
 use quick_xml::events::Event;
 use quick_xml::Reader;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::iter::repeat_n;
 use thiserror::Error;
 use reqwest::blocking::{Client, Response};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT_LANGUAGE, CONTENT_TYPE};
 use std::time::Duration;
-
+use aes::cipher::BlockModeEncrypt;
+use scraper::{Html, Selector};
+use serde::{Deserialize, Serialize};
+use crate::{GridRow, Root, Student, Term};
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const HUIS_BASE: &str = "https://huis.honam.ac.kr";
@@ -66,6 +69,12 @@ const DAY_FIELDS: &[(&str, &str, &str, &str, &str)] = &[
     ("SAT", "P6", "L6", "B6", "SAT"),
 ];
 
+#[derive(Serialize, Deserialize, Debug)]
+pub struct LoginToken {
+    secure_token: String,
+    secure_session_id: String,
+}
+
 // ─── Errors ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Error)]
@@ -110,6 +119,17 @@ impl HttpResponse {
     }
 }
 
+impl TryFrom<Response> for HttpResponse {
+    type Error = HuisError;
+
+    fn try_from(value: Response) -> std::result::Result<Self, Self::Error> {
+        let status = value.status().as_u16();
+        let url = value.url().to_string();
+        let text = value.text().unwrap_or_default();
+        Ok(Self { text, url, status_code: status })
+    }
+}
+
 struct HttpSession {
     client: Client,
 }
@@ -136,7 +156,7 @@ impl HttpSession {
             .headers(headers)
             .query(params)
             .send()?;
-        Self::into_response(resp)
+        HttpResponse::try_from(resp)
     }
 
     fn post_form(
@@ -151,7 +171,7 @@ impl HttpSession {
             .headers(headers)
             .form(form)
             .send()?;
-        Self::into_response(resp)
+        HttpResponse::try_from(resp)
     }
 
     fn post_body(
@@ -168,15 +188,10 @@ impl HttpSession {
             .header(CONTENT_TYPE, content_type)
             .body(body)
             .send()?;
-        Self::into_response(resp)
+        HttpResponse::try_from(resp)
     }
 
-    fn into_response(resp: Response) -> Result<HttpResponse> {
-        let status = resp.status().as_u16();
-        let url = resp.url().to_string();
-        let text = resp.text().unwrap_or_default();
-        Ok(HttpResponse { text, url, status_code: status })
-    }
+
 }
 
 // ─── Header builder ───────────────────────────────────────────────────────────
@@ -267,7 +282,7 @@ fn encrypt_nmain_payload(plain_xml: &str) -> String {
     }
     let mut buf = data.clone();
     Aes128CbcEnc::new(AES_KEY.into(), AES_IV.into())
-        .encrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut buf, data.len())
+        .encrypt_padded::<cbc::cipher::block_padding::NoPadding>(&mut buf, data.len())
         .expect("buffer is already block-aligned");
     B64.encode(&buf)
 }
@@ -402,7 +417,7 @@ fn parse_xml_response(xml_text: &str) -> Result<NMainResponse> {
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) => {
+            Ok(Event::Start(e)) => {
                 let local = strip_ns(e.name().as_ref());
                 match local.as_str() {
                     "Parameter" => {
@@ -428,7 +443,7 @@ fn parse_xml_response(xml_text: &str) -> Result<NMainResponse> {
                     _ => {}
                 }
             }
-            Ok(Event::End(ref e)) => {
+            Ok(Event::End(e)) => {
                 match strip_ns(e.name().as_ref()).as_str() {
                     "Parameter" => { current_param_id = None; }
                     "Row" => {
@@ -441,11 +456,11 @@ fn parse_xml_response(xml_text: &str) -> Result<NMainResponse> {
                     _ => {}
                 }
             }
-            Ok(Event::Text(ref e)) => {
+            Ok(Event::Text(e)) => {
                 let text = quick_xml::escape::unescape(&e.decode().unwrap_or_default())
                     .unwrap_or_default()
                     .to_string();
-                if let Some(ref pid) = current_param_id {
+                if let Some(pid) = &current_param_id {
                     resp.parameters.insert(pid.clone(), text);
                 } else if let (Some(col_id), Some(row)) = (&current_col_id, &mut current_row) {
                     row.insert(col_id.clone(), text);
@@ -500,7 +515,7 @@ fn post_nmain(session: &HttpSession, plain_xml: &str) -> Result<NMainResponse> {
 
 // ─── SSO + direct login ────────────────────────────────────────────────────────
 
-fn sso_login(session: &HttpSession, user_id: &str, password: &str) -> Result<()> {
+fn sso_login(session: &HttpSession, user_id: &str, password: &str) -> Result<LoginToken> {
     let index_url = format!("{}/HUIS/index.html", HUIS_BASE);
     let home = session.get(&index_url, build_headers(None, None, None)?, &[])?;
     home.raise_for_status()?;
@@ -526,6 +541,22 @@ fn sso_login(session: &HttpSession, user_id: &str, password: &str) -> Result<()>
         return Err(HuisError::Login("SSO login failed. Check the credentials.".into()));
     }
 
+    let document = Html::parse_document(&login_resp.text);
+    let token_selector = Selector::parse(r#"input#secureToken"#).unwrap();
+    let session_selector = Selector::parse(r#"input#secureSessionId"#).unwrap();
+
+    let secure_token = document
+        .select(&token_selector)
+        .next()
+        .and_then(|e| e.value().attr("value"))
+        .unwrap_or("not found").to_string();
+
+    let secure_session_id = document
+        .select(&session_selector)
+        .next()
+        .and_then(|e| e.value().attr("value"))
+        .unwrap_or("not found").to_string();
+
     let current = follow_auto_forms(session, login_resp)?;
     let current = follow_auto_forms(session, current)?;
 
@@ -533,7 +564,7 @@ fn sso_login(session: &HttpSession, user_id: &str, password: &str) -> Result<()>
         return Err(HuisError::Login("SSO bootstrap did not complete as expected.".into()));
     }
 
-    Ok(())
+    Ok(LoginToken { secure_token, secure_session_id})
 }
 
 fn direct_login(session: &HttpSession, user_id: &str) -> Result<HashMap<String, String>> {
@@ -708,7 +739,7 @@ fn normalize_grid_rows(rows: &[HashMap<String, String>]) -> Vec<Value> {
             let days: serde_json::Map<String, Value> = DAY_FIELDS
                 .iter()
                 .filter_map(|(dc, pc, lc, sc, dn)| {
-                    let course_name = row.get(*dc)?.as_str();
+                    let course_name = row.get(*dc)?;
                     if course_name.is_empty() { return None; }
                     let entry = serde_json::json!({
                         "course_name": course_name,
@@ -832,15 +863,16 @@ fn build_meeting_blocks(
 
 // ─── Top-level fetch ──────────────────────────────────────────────────────────
 
-pub fn fetch_timetable(user_id: &str, password: &str) -> Result<Value> {
+pub fn fetch_timetable(user_id: &str, password: &str) -> Result<(Root, LoginToken)> {
     let session = HttpSession::new(TIMEOUT)?;
-    sso_login(&session, user_id, password)?;
+    let login_token = sso_login(&session, user_id, password)?;
     let user_info = direct_login(&session, user_id)?;
 
     let actual_user_id = user_info.get("USRID").cloned().unwrap_or_else(|| user_id.to_string());
     let actual_user_name = user_info.get("USRNM").cloned().unwrap_or_default();
 
     let term = fetch_current_term(&session, &actual_user_id, &actual_user_name)?;
+    println!("{:?}", term);
     let year = term.get("SADM302").cloned().unwrap_or_default();
     let semester = term.get("SADM303").cloned().unwrap_or_default();
 
@@ -849,30 +881,16 @@ pub fn fetch_timetable(user_id: &str, password: &str) -> Result<Value> {
 
     let courses = normalize_courses(&course_rows);
     let meeting_blocks = build_meeting_blocks(&courses, &grid_rows);
-    let grid = normalize_grid_rows(&grid_rows);
+    let grid: Vec<_> = aggregate_courses_from_grid(normalize_grid_rows(&grid_rows));
 
     let kst = FixedOffset::east_opt(9 * 3600).unwrap();
     let fetched_at = Utc::now().with_timezone(&kst).to_rfc3339();
 
-    Ok(serde_json::json!({
-        "student": {
-            "id":              actual_user_id,
-            "name":            actual_user_name,
-            "department_code": user_info.get("DPT_CD"),
-            "department_name": user_info.get("MAIN_DPT_NM")
-                                   .or_else(|| user_info.get("MAJOR_NM")),
-            "grade_code":      user_info.get("GRADE_CD"),
-        },
-        "term": {
-            "year":          year,
-            "semester":      semester,
-            "semester_name": term.get("SADM303_H"),
-        },
-        "courses":        courses,
-        "meeting_blocks": meeting_blocks,
-        "grid_rows":      grid,
-        "fetched_at":     fetched_at,
-    }))
+    let student = Student { id: actual_user_id, name: actual_user_name, department_code: user_info.get("DPT_CD").unwrap_or(&String::new()).clone() };
+    let term = Term { year, semester };
+    let root = Root { student, grid_rows: grid, fetched_at, term };
+
+    Ok((root, login_token))
 }
 
 // ─── HTML parsing utilities (unchanged) ──────────────────────────────────────
@@ -983,4 +1001,29 @@ fn origin_of(url: &str) -> String {
     let rest = &url[after_scheme..];
     let host_end = rest.find('/').unwrap_or(rest.len());
     format!("{}{}", &url[..after_scheme], &rest[..host_end])
+}
+
+fn aggregate_courses_from_grid(grid_rows: Vec<Value>) -> Vec<GridRow> {
+    grid_rows.into_iter().filter_map(|row| {
+        if let Some(object) = row.as_object() &&
+            let Ok(mut grid_data) = GridRow::deserialize(object) {
+                let days = ["MON", "TUE", "WED", "THU", "FRI"];
+                let mut map = Map::new();
+
+                for day in days {
+                    let grid_day = grid_data.days.get(day).and_then(|value| value.as_object());
+                    if let Some(grid_day) = grid_day {
+                        map.insert(day.to_string(), Value::Object(grid_day.clone()));
+                    }
+                }
+
+                let (hour, minute) = grid_data.time_code.split_at(2);
+
+                let time_label = format!("{}:{}", hour, minute);
+                grid_data.time_label = time_label;
+
+                return Some(grid_data);
+        }
+        None
+    }).collect()
 }
